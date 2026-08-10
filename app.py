@@ -5,6 +5,7 @@ import io
 import base64
 
 import torch
+torch.set_num_threads(1)
 import torch.nn as nn
 from torchvision import models, transforms
 
@@ -145,6 +146,9 @@ checkpoint = torch.load(
 model.load_state_dict(checkpoint)
 
 model = model.to(device)
+
+for param in model.parameters():
+    param.requires_grad = False
 
 model.eval()
 
@@ -393,8 +397,8 @@ def index():
 
 if __name__ == "__main__":
 
-    app.run(
-        debug=True,
-        host="127.0.0.1",
-        port=5000
-    )
+  app.run(
+    debug=False,
+    host="0.0.0.0",
+    port=5000
+)
