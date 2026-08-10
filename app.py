@@ -25,9 +25,7 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 # Device
 # ==========================================
 
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
+device = torch.device("cpu")
 
 print("Using device:", device)
 
@@ -149,6 +147,9 @@ model.load_state_dict(checkpoint)
 model = model.to(device)
 
 model.eval()
+
+for param in model.parameters():
+    param.requires_grad = False
 
 print("Brain Tumor model loaded successfully!")
 
