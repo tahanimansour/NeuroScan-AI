@@ -5,7 +5,6 @@ import io
 import base64
 
 import torch
-torch.set_num_threads(1)
 import torch.nn as nn
 from torchvision import models, transforms
 
@@ -26,14 +25,16 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 # Device
 # ==========================================
 
-device = torch.device("cpu")
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 print("Using device:", device)
 
 
 # ==========================================
-# Class Names
-# نفس ترتيب التدريب
+# Tumor Class Names
+# نفس ترتيب تدريب المودل الأساسي
 # ==========================================
 
 class_names = [
@@ -102,68 +103,113 @@ class_information = {
 
 
 # ==========================================
-# Temperature Calibration
+# Paths
+# ==========================================
+
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+TUMOR_MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "best_brain_model.pth"
+)
+
+VALIDATOR_MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "best_mri_validator.pth"
+)
+
+
+# ==========================================
+# MRI Validator Settings
+# ==========================================
+
+MRI_THRESHOLD = 0.80
+
+
+# ==========================================
+# Tumor Model
+# ResNet50 + Dropout + Linear
+# ==========================================
+
+tumor_model = models.resnet50(
+    weights=None
+)
+
+num_features = tumor_model.fc.in_features
+
+tumor_model.fc = nn.Sequential(
+    nn.Dropout(0.5),
+    nn.Linear(num_features, 4)
+)
+
+
+tumor_checkpoint = torch.load(
+    TUMOR_MODEL_PATH,
+    map_location=device,
+    weights_only=True
+)
+
+tumor_model.load_state_dict(
+    tumor_checkpoint
+)
+
+tumor_model = tumor_model.to(device)
+
+tumor_model.eval()
+
+print("Brain Tumor model loaded successfully!")
+
+
+# ==========================================
+# MRI Validator Model
+# MobileNetV3 Small
+# ==========================================
+
+validator_model = models.mobilenet_v3_small(
+    weights=None
+)
+
+validator_in_features = (
+    validator_model.classifier[3].in_features
+)
+
+validator_model.classifier[3] = nn.Linear(
+    validator_in_features,
+    2
+)
+
+
+validator_checkpoint = torch.load(
+    VALIDATOR_MODEL_PATH,
+    map_location=device,
+    weights_only=True
+)
+
+validator_model.load_state_dict(
+    validator_checkpoint
+)
+
+validator_model = validator_model.to(device)
+
+validator_model.eval()
+
+print("MRI Validator model loaded successfully!")
+
+
+# ==========================================
+# Tumor Model Temperature Calibration
 # ==========================================
 
 temperature = 1.1327744722366333
 
 
 # ==========================================
-# Model Architecture
-# ResNet50 + Dropout + Linear
+# Tumor Model Transform
 # ==========================================
 
-model = models.resnet50(weights=None)
-
-num_features = model.fc.in_features
-
-model.fc = nn.Sequential(
-    nn.Dropout(0.5),
-    nn.Linear(num_features, 4)
-)
-
-
-# ==========================================
-# Model Path
-# ==========================================
-
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "best_brain_model.pth"
-)
-
-
-# ==========================================
-# Load Trained Model
-# ==========================================
-
-checkpoint = torch.load(
-    MODEL_PATH,
-    map_location=device,
-    weights_only=True
-)
-
-model.load_state_dict(checkpoint)
-
-model = model.to(device)
-
-for param in model.parameters():
-    param.requires_grad = False
-
-model.eval()
-
-for param in model.parameters():
-    param.requires_grad = False
-
-print("Brain Tumor model loaded successfully!")
-
-
-# ==========================================
-# Image Preprocessing
-# نفس test_transform المستخدم أثناء التدريب
-# ==========================================
-
-transform = transforms.Compose([
+tumor_transform = transforms.Compose([
 
     transforms.Resize((224, 224)),
 
@@ -178,38 +224,98 @@ transform = transforms.Compose([
 
 
 # ==========================================
-# Prediction Function
+# Validator Transform
+# نفس test_transform المستخدم أثناء التدريب
+# ==========================================
+
+validator_transform = transforms.Compose([
+
+    transforms.Resize((224, 224)),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+
+])
+
+
+# ==========================================
+# MRI Validation Function
+# ==========================================
+
+def validate_brain_mri(image):
+
+    image = image.convert("RGB")
+
+    image_tensor = validator_transform(
+        image
+    )
+
+    image_tensor = image_tensor.unsqueeze(0)
+
+    image_tensor = image_tensor.to(device)
+
+    with torch.inference_mode():
+
+        outputs = validator_model(
+            image_tensor
+        )
+
+        probabilities = torch.softmax(
+            outputs,
+            dim=1
+        )
+
+        # Class index 1 = Brain MRI
+        brain_probability = (
+            probabilities[0, 1].item()
+        )
+
+    is_valid_brain_mri = (
+        brain_probability >= MRI_THRESHOLD
+    )
+
+    return (
+        is_valid_brain_mri,
+        brain_probability
+    )
+
+
+# ==========================================
+# Tumor Prediction Function
 # ==========================================
 
 def predict_image(image):
 
-    # Convert image to RGB
     image = image.convert("RGB")
 
-    # Apply preprocessing
-    image_tensor = transform(image)
+    image_tensor = tumor_transform(
+        image
+    )
 
-    # Add batch dimension
     image_tensor = image_tensor.unsqueeze(0)
 
-    # Move to device
     image_tensor = image_tensor.to(device)
 
-    # Prediction
     with torch.inference_mode():
 
-        outputs = model(image_tensor)
+        outputs = tumor_model(
+            image_tensor
+        )
 
         # Temperature Scaling
-        calibrated_outputs = outputs / temperature
+        calibrated_outputs = (
+            outputs / temperature
+        )
 
-        # Probabilities
         probabilities = torch.softmax(
             calibrated_outputs,
             dim=1
         )[0]
 
-    # Best class
     predicted_index = torch.argmax(
         probabilities
     ).item()
@@ -218,16 +324,16 @@ def predict_image(image):
         predicted_index
     ]
 
-    # Highest probability
     confidence = (
         probabilities[predicted_index].item()
         * 100
     )
 
-    # All class probabilities
     all_probabilities = {}
 
-    for i in range(len(class_names)):
+    for i in range(
+        len(class_names)
+    ):
 
         display_name = display_names[
             class_names[i]
@@ -238,7 +344,9 @@ def predict_image(image):
             * 100
         )
 
-        all_probabilities[display_name] = round(
+        all_probabilities[
+            display_name
+        ] = round(
             probability,
             2
         )
@@ -252,7 +360,6 @@ def predict_image(image):
 
 # ==========================================
 # Create Image Preview
-# حتى تبقى الصورة ظاهرة بعد Analyze
 # ==========================================
 
 def create_image_preview(image):
@@ -289,25 +396,25 @@ def index():
     disease_info = None
     error = None
 
-    # ======================================
-    # User clicked Analyze MRI
-    # ======================================
-
     if request.method == "POST":
 
-        # Check if image exists
         if "mri_image" not in request.files:
 
-            error = "Please select an MRI image."
+            error = (
+                "Please select an MRI image."
+            )
 
         else:
 
-            file = request.files["mri_image"]
+            file = request.files[
+                "mri_image"
+            ]
 
-            # Check filename
             if file.filename == "":
 
-                error = "Please select an MRI image."
+                error = (
+                    "Please select an MRI image."
+                )
 
             else:
 
@@ -321,41 +428,81 @@ def index():
                         file.stream
                     ).convert("RGB")
 
+
                     # ==================================
                     # Keep Image Visible
                     # ==================================
 
-                    image_preview = create_image_preview(
-                        image
+                    image_preview = (
+                        create_image_preview(
+                            image
+                        )
                     )
 
+
                     # ==================================
-                    # Prediction
+                    # Step 1:
+                    # Validate Brain MRI
                     # ==================================
 
                     (
-                        predicted_class,
-                        confidence,
-                        probabilities
-                    ) = predict_image(
+                        is_valid_brain_mri,
+                        brain_probability
+                    ) = validate_brain_mri(
                         image
                     )
 
+                    print(
+                        "Brain MRI probability:",
+                        round(
+                            brain_probability * 100,
+                            2
+                        ),
+                        "%"
+                    )
+
+
                     # ==================================
-                    # Display-Friendly Name
+                    # Reject Non-Brain Images
                     # ==================================
 
-                    prediction = display_names[
-                        predicted_class
-                    ]
+                    if not is_valid_brain_mri:
 
-                    # ==================================
-                    # Information About Result
-                    # ==================================
+                        error = (
+                            "The uploaded image does not appear "
+                            "to be a valid brain MRI scan. "
+                            "Please upload a clear brain MRI image."
+                        )
 
-                    disease_info = class_information[
-                        predicted_class
-                    ]
+                    else:
+
+                        # ==============================
+                        # Step 2:
+                        # Tumor Classification
+                        # ==============================
+
+                        (
+                            predicted_class,
+                            confidence,
+                            probabilities
+                        ) = predict_image(
+                            image
+                        )
+
+
+                        prediction = (
+                            display_names[
+                                predicted_class
+                            ]
+                        )
+
+
+                        disease_info = (
+                            class_information[
+                                predicted_class
+                            ]
+                        )
+
 
                 except Exception as e:
 
@@ -369,9 +516,6 @@ def index():
                         "Please upload a valid MRI image."
                     )
 
-    # ======================================
-    # Send Everything to index.html
-    # ======================================
 
     return render_template(
 
@@ -397,8 +541,8 @@ def index():
 
 if __name__ == "__main__":
 
-  app.run(
-    debug=False,
-    host="0.0.0.0",
-    port=5000
-)
+    app.run(
+        debug=True,
+        host="127.0.0.1",
+        port=5000
+    )
