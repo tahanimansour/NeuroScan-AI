@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 # ==========================================
@@ -19,6 +19,18 @@ app = Flask(__name__)
 
 # Maximum uploaded image size: 10 MB
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+
+
+# ==========================================
+# CPU Optimization
+# ==========================================
+
+torch.set_num_threads(1)
+
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
 
 
 # ==========================================
@@ -155,6 +167,8 @@ tumor_model.load_state_dict(
     tumor_checkpoint
 )
 
+del tumor_checkpoint
+
 tumor_model = tumor_model.to(device)
 
 tumor_model.eval()
@@ -190,6 +204,8 @@ validator_checkpoint = torch.load(
 validator_model.load_state_dict(
     validator_checkpoint
 )
+
+del validator_checkpoint
 
 validator_model = validator_model.to(device)
 
@@ -243,6 +259,39 @@ validator_transform = transforms.Compose([
 
 
 # ==========================================
+# Prepare Uploaded Image
+# ==========================================
+
+def prepare_uploaded_image(image):
+
+    # Fix orientation from EXIF metadata
+    image = ImageOps.exif_transpose(
+        image
+    )
+
+    image = image.convert("RGB")
+
+    # Prevent extremely large images from
+    # consuming too much RAM.
+    max_dimension = 2000
+
+    if (
+        image.width > max_dimension
+        or image.height > max_dimension
+    ):
+
+        image.thumbnail(
+            (
+                max_dimension,
+                max_dimension
+            ),
+            Image.Resampling.LANCZOS
+        )
+
+    return image
+
+
+# ==========================================
 # MRI Validation Function
 # ==========================================
 
@@ -277,6 +326,10 @@ def validate_brain_mri(image):
     is_valid_brain_mri = (
         brain_probability >= MRI_THRESHOLD
     )
+
+    del image_tensor
+    del outputs
+    del probabilities
 
     return (
         is_valid_brain_mri,
@@ -351,6 +404,11 @@ def predict_image(image):
             2
         )
 
+    del image_tensor
+    del outputs
+    del calibrated_outputs
+    del probabilities
+
     return (
         predicted_class,
         confidence,
@@ -364,12 +422,21 @@ def predict_image(image):
 
 def create_image_preview(image):
 
+    display_image = image.copy()
+
+    # Keep preview lightweight for the web
+    display_image.thumbnail(
+        (800, 800),
+        Image.Resampling.LANCZOS
+    )
+
     buffer = io.BytesIO()
 
-    image.convert("RGB").save(
+    display_image.save(
         buffer,
         format="JPEG",
-        quality=90
+        quality=80,
+        optimize=True
     )
 
     encoded_image = base64.b64encode(
@@ -426,7 +493,16 @@ def index():
 
                     image = Image.open(
                         file.stream
-                    ).convert("RGB")
+                    )
+
+
+                    # ==================================
+                    # Fix Orientation + Limit Size
+                    # ==================================
+
+                    image = prepare_uploaded_image(
+                        image
+                    )
 
 
                     # ==================================
